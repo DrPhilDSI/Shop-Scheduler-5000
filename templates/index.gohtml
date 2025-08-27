@@ -1,0 +1,327 @@
+{{define "index.gohtml"}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Machine Shop Scheduler</title>
+  <link rel="stylesheet" href="https://unpkg.com/@picocss/pico@2.0.6/css/pico.min.css">
+  <style>
+    :root{
+      --gap:.5rem; --bg:#0f1115; --panel:#151821; --muted:#2a2f3a; --txt:#e6e8ef; --sub:#9aa3b2; --shadow: 0 8px 24px rgba(0,0,0,.35);
+      --leftCol: 200px;          /* sticky employee column width */
+      --sepCol:   8px;           /* vertical separator between names and days */
+      --dayCol:  260px;          /* each day column width */
+      --accent-backlog-grad: linear-gradient(180deg, #1f4a36 0%, #152c22 100%);
+      --accent-schedule-grad: linear-gradient(180deg, #1c3455 0%, #0f1a2a 100%);
+    }
+    html { font-size:14px; }
+    body { background:var(--bg); color:var(--txt); overflow-x:hidden; }
+    h1 { font-size:1.6rem; margin:.6rem 0 1.2rem; }
+    .badge { color:#c7c9d1; }
+    .container { max-width:1200px; margin-inline:auto; padding-inline:.8rem; }
+
+    .toolbar { display:flex; justify-content:space-between; align-items:center; margin:.6rem 0 1.2rem; }
+    .legend { display:flex; gap:.8rem; align-items:center; }
+    .sw { width:12px; height:12px; border-radius:3px; display:inline-block; }
+    .sw.mill{ background:#45d483; }
+    .sw.turn{ background:#6ab3ff; }
+    .toolbar a[role="button"]{ white-space:nowrap; }
+
+    /* ====== PANELS ====== */
+    .panel {
+      position:relative; border:1px solid var(--muted); background:var(--panel);
+      border-radius:14px; padding:1rem; margin-bottom:1.4rem; box-shadow: var(--shadow); overflow:hidden;
+    }
+    .panel .panel-title {
+      margin:0 0 .8rem; font-size:1.05rem; display:flex; align-items:center; gap:.5rem; color:#fff; font-weight:700;
+    }
+    .panel .panel-sub { margin-top:-.5rem; margin-bottom:.6rem; color:var(--sub); font-size:.9rem; }
+    .panel::before { content:""; position:absolute; inset:0 0 0 auto; width:8px; pointer-events:none; opacity:.9; }
+    .panel.backlog::before  { background:var(--accent-backlog-grad); }
+    .panel.schedule::before { background:var(--accent-schedule-grad); }
+    .panel::after { content:""; position:absolute; inset:0 auto auto 0; height:60px; width:100%;
+      background: linear-gradient(180deg, rgba(255,255,255,.03), transparent); pointer-events:none; }
+
+    /* Backlog chips (inline, wraps) */
+    .chips { display:flex; flex-wrap:wrap; gap:.6rem .7rem; align-items:flex-start; }
+    .jobchip {
+      display:inline-flex; align-items:center; gap:.5rem;
+      border:1px solid var(--muted); background:#0f121b; color:var(--txt);
+      padding:.5rem .75rem; border-radius:14px; font-size:.9rem;
+      line-height:1.15; box-shadow: 0 1px 0 rgba(0,0,0,.3) inset; cursor: default;
+    }
+    .jobchip b { font-weight:700; white-space:nowrap; }
+    .jobchip .rem { color:var(--sub); white-space:nowrap; }
+    .pill { display:inline-block; padding:.12rem .45rem; border-radius:999px; font-size:.72rem; border:1px solid var(--muted); }
+    .pill.mill { background:#163526; }
+    .pill.turn { background:#182a44; }
+
+    /* ====== SCHEDULE (unified grid, sticky names, horizontal scroll) ====== */
+    .calendar-wrap { overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch; scrollbar-gutter:stable; }
+    .schedule-grid {
+      width:max-content;
+      display:grid;
+      grid-template-columns: var(--leftCol) var(--sepCol) repeat(7, var(--dayCol));  /* names | separator | 7 days */
+      gap: var(--gap);
+      align-items:stretch;                      /* ensures row heights are synced */
+    }
+
+    /* top row */
+    .corner { position:sticky; left:0; z-index:5; background:var(--panel); border:1px solid var(--muted);
+              border-radius:8px; height:48px; }
+    .sepHead { width:var(--sepCol); }
+    .day-head {
+      text-align:center; padding:.25rem 0; color:#e6e8ef; font-weight:700; font-size:.95rem;
+      background:var(--panel); border:1px solid var(--muted); border-radius:8px;
+    }
+
+    /* names column (sticky) + separator (sticky) */
+    .emp-card {
+      background:var(--panel); border:1px solid var(--muted); border-radius:8px; padding:.5rem .6rem;
+      position:sticky; left:0; z-index:4;  /* stays visible while days scroll */
+      display:flex; flex-direction:column; justify-content:center;
+    }
+    .emp-card strong { display:block; }
+    .emp-card small { color:var(--sub); font-size:.8rem; }
+    .sepCell {
+      position:sticky; left:calc(var(--leftCol) + var(--gap)); width:var(--sepCol);
+      background:#20252e; border-radius:8px; box-shadow: inset -1px 0 0 #2a2f3a, inset 1px 0 0 #2a2f3a;
+      z-index:3;
+    }
+
+    /* schedule cells (one per day per employee) */
+    .cell { border:1px solid var(--muted); background:var(--panel); border-radius:8px;
+            min-height:80px; padding:.45rem .55rem; display:flex; flex-direction:column; gap:.32rem; }
+    .lane { border:1px dashed var(--muted); border-radius:8px; padding:.24rem; position:relative; }
+    .lane-title { color:var(--sub); font-size:.72rem; margin-bottom:.16rem; }
+
+    /* blocks row scrolls inside the day cell (for dense ops) with shadows */
+    .blocks {
+      display:flex; flex-wrap:nowrap; gap:.24rem; align-items:stretch; width:100%;
+      overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch; scrollbar-gutter:stable; position:relative;
+    }
+    .blocks::-webkit-scrollbar { height:8px; }
+    .blocks::-webkit-scrollbar-thumb { background:#2e3442; border-radius:6px; }
+    .blocks::before, .blocks::after {
+      content:""; position:sticky; top:0; bottom:0; width:24px; pointer-events:none; z-index:5; transition:opacity .2s;
+    }
+    .blocks::before { left:0; background:linear-gradient(to right, rgba(15,17,21,.85), transparent); opacity:0; }
+    .blocks::after  { right:0; background:linear-gradient(to left, rgba(15,17,21,.85), transparent); opacity:0; }
+    .blocks.has-left::before { opacity:1; }
+    .blocks.has-right::after { opacity:1; }
+
+    /* blocks (animate with max-width; text stays horizontal with ellipsis) */
+    .block{
+      border:1px solid var(--muted); border-left-width:5px; border-radius:8px;
+      padding:.28rem .48rem; font-size:.82rem; color:var(--txt);
+      display:flex; flex-direction:column; justify-content:center; align-items:flex-start;
+      flex:0 0 auto; max-width:0; transition:max-width .3s ease-out;
+      overflow:hidden; line-height:1.15; cursor: default;
+    }
+    .block.mill{ border-left-color:#45d483; }
+    .block.turn{ border-left-color:#6ab3ff; }
+    .block strong, .block small { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .block small { color:var(--sub); font-size:.72rem; }
+
+    /* utilization bar */
+    .util { position:relative; height:10px; border-radius:999px; background:#0e1220; border:1px solid var(--muted); overflow:hidden; }
+    .util>span{ position:absolute; top:0; left:0; height:100%; background:#2c7e85bd; transition:width .3s ease-out; }
+    .util-label{ font-size:.72rem; color:var(--sub); }
+
+    /* Hover card */
+    .hover-card {
+      position: fixed; z-index: 9999; min-width: 220px; max-width: 360px;
+      background: #0f121b; color: var(--txt);
+      border: 1px solid var(--muted); border-radius: 12px; box-shadow: var(--shadow);
+      padding: .6rem .75rem; opacity: 0; transform: translateY(6px);
+      pointer-events: none; transition: opacity .15s ease, transform .15s ease;
+      font-size: .88rem;
+    }
+    .hover-card.show { opacity: 1; transform: translateY(0); }
+    .hover-card h5 { margin: 0 0 .25rem; font-size: 1rem; }
+    .hover-card .meta { color: var(--sub); font-size: .78rem; }
+    .hover-card .row { display:flex; justify-content:space-between; gap:.8rem; }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <header class="toolbar">
+      <h1>Auto Scheduler 5000</h1>
+      <div class="legend">
+        <span><span class="sw mill"></span> Mill</span>
+        <span><span class="sw turn"></span> Turn</span>
+        <a role="button" href="/api/reset">Auto Schedule</a>
+      </div>
+    </header>
+
+    <!-- Backlog Panel -->
+    <section class="panel backlog">
+      <h3 class="panel-title">Job Backlog</h3>
+      <div class="chips">
+        {{range .Backlog}}
+          {{$done := index $.JobHours .ID}}
+          {{$rem := sub .RunHours $done}}
+          <span class="jobchip"
+                data-kind="backlog"
+                data-name="{{.Name}}"
+                data-total="{{.RunHours}}"
+                data-remaining="{{if lt $rem 0}}0{{else}}{{$rem}}{{end}}">
+            <b>{{.Name}}</b>
+            <span class="rem">({{if lt $rem 0}}0{{else}}{{$rem}}{{end}}h left / {{.RunHours}}h)</span>
+            {{range .Processes}}<span class="pill {{.}}">{{title .}}</span>{{end}}
+          </span>
+        {{end}}
+        {{if not .Backlog}}
+          <span class="jobchip"><b>All caught up 🎉</b></span>
+        {{end}}
+      </div>
+    </section>
+
+    <!-- Schedule Panel -->
+    <section class="panel schedule">
+      <h3 class="panel-title">Schedule</h3>
+      <p class="panel-sub">Week of {{.WeekStart.Format "Mon Jan 2, 2006"}}</p>
+
+      <div class="calendar-wrap" id="calendarWrap">
+        <div class="schedule-grid">
+          <!-- HEADER ROW -->
+          <div class="corner"></div>
+          <div class="sepHead"></div>
+          {{range .Days}}
+            <div class="day-head">{{.Format "Mon"}}<br><span class="badge">{{.Format "Jan 2"}}</span></div>
+          {{end}}
+
+          <!-- EMPLOYEE ROWS -->
+          {{range $e := .Employees}}
+            <!-- sticky name cell (matches row height automatically) -->
+            <div class="emp-card">
+              <strong>{{$e.Name}}</strong>
+              <small>{{title $e.Shift}} • {{$e.HoursPerDay}}h/day • Left: {{index $.EmpWeekLeft $e.ID}}h</small>
+            </div>
+            <!-- sticky separator column -->
+            <div class="sepCell" aria-hidden="true"></div>
+
+            <!-- 7 day cells -->
+            {{range $di, $d := $.Days}}
+              {{ $util := index $.Util $e.ID }}
+              {{ $used := index $util $di }}
+              <div class="cell">
+                <div class="util"><span data-width="{{pctHours $used}}" style="width:0;"></span></div>
+                <div class="util-label">{{$used}}/8h • Left: {{sub 8 $used}}h</div>
+
+                <div class="lane">
+                  <div class="lane-title">Day shift</div>
+                  <div class="blocks">
+                    {{range $a := $.Assignments}}
+                      {{if and (eq $a.EmployeeID $e.ID) (eq $a.DayIndex $di) (eq $a.Shift "day") }}
+                        {{$job := index $.JobByID $a.JobID}} {{$mac := index $.MacByID $a.MachineID}}
+                        <div class="block {{$a.Process}}" data-target="{{pctHours $a.Hours}}" style="max-width:0;"
+                             data-kind="assign"
+                             data-name="{{$job.Name}}" data-hours="{{$a.Hours}}" data-proc="{{title $a.Process}}"
+                             data-machine="{{$mac.Name}}" data-employee="{{$e.Name}}"
+                             data-day="{{($d).Format "Mon 1/2"}}" data-shift="Day">
+                          <strong>{{$job.Name}}</strong>
+                          <small>{{$a.Hours}}h • {{title $a.Process}} • {{$mac.Name}}</small>
+                        </div>
+                      {{end}}
+                    {{end}}
+                  </div>
+                </div>
+
+                <div class="lane" style="margin-top:.28rem;">
+                  <div class="lane-title">Night shift</div>
+                  <div class="blocks">
+                    {{range $a := $.Assignments}}
+                      {{if and (eq $a.EmployeeID $e.ID) (eq $a.DayIndex $di) (eq $a.Shift "night") }}
+                        {{$job := index $.JobByID $a.JobID}} {{$mac := index $.MacByID $a.MachineID}}
+                        <div class="block {{$a.Process}}" data-target="{{pctHours $a.Hours}}" style="max-width:0;"
+                             data-kind="assign"
+                             data-name="{{$job.Name}}" data-hours="{{$a.Hours}}" data-proc="{{title $a.Process}}"
+                             data-machine="{{$mac.Name}}" data-employee="{{$e.Name}}"
+                             data-day="{{($d).Format "Mon 1/2"}}" data-shift="Night">
+                          <strong>{{$job.Name}}</strong>
+                          <small>{{$a.Hours}}h • {{title $a.Process}} • {{$mac.Name}}</small>
+                        </div>
+                      {{end}}
+                    {{end}}
+                  </div>
+                </div>
+              </div>
+            {{end}}
+          {{end}}
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Hover Card -->
+  <div id="hoverCard" class="hover-card" aria-hidden="true"></div>
+
+  <script>
+    // Animate blocks + utilization bars; reset scroll positions
+    function animateBlocks(){
+      document.querySelectorAll('.block').forEach(el=>{
+        const w = el.getAttribute('data-target')||'0%';
+        el.style.maxWidth='0%';
+        requestAnimationFrame(()=>{ el.style.maxWidth=`calc(${w} - .1rem)`; });
+      });
+      document.querySelectorAll('.util>span').forEach(el=>{
+        const w = el.getAttribute('data-width')||'0%';
+        el.style.width='0%';
+        requestAnimationFrame(()=>{ el.style.width=w; });
+      });
+      setTimeout(()=> {
+        const wrap=document.getElementById('calendarWrap');
+        if(wrap) wrap.scrollLeft=0;
+        document.querySelectorAll('.blocks').forEach(r=>r.scrollLeft=0);
+      }, 340);
+    }
+    animateBlocks();
+
+    // Per-lane scroll shadows
+    function updateShadows(el){
+      el.classList.toggle('has-left', el.scrollLeft>4);
+      el.classList.toggle('has-right', el.scrollWidth - el.clientWidth - el.scrollLeft > 4);
+    }
+    document.querySelectorAll('.blocks').forEach(b=>{
+      updateShadows(b);
+      b.addEventListener('scroll', ()=>updateShadows(b));
+      window.addEventListener('resize', ()=>updateShadows(b));
+    });
+
+    // Hover cards
+    const card=document.getElementById('hoverCard');
+    function showCard(html,x,y){
+      card.innerHTML=html;
+      card.style.left=(x+14)+'px'; card.style.top=(y+14)+'px';
+      const r=card.getBoundingClientRect(), vw=innerWidth, vh=innerHeight;
+      if(r.right>vw-8) card.style.left=Math.max(8,x-r.width-14)+'px';
+      if(r.bottom>vh-8) card.style.top=Math.max(8,y-r.height-14)+'px';
+      card.classList.add('show'); card.setAttribute('aria-hidden','false');
+    }
+    function hideCard(){ card.classList.remove('show'); card.setAttribute('aria-hidden','true'); }
+    function backlogHTML(el){ return `<h5>${el.dataset.name}</h5><div class="meta">Backlog</div>
+      <div class="row"><span>Remaining</span><strong>${el.dataset.remaining}h</strong></div>
+      <div class="row"><span>Total</span><strong>${el.dataset.total}h</strong></div>`; }
+    function assignHTML(el){ return `<h5>${el.dataset.name}</h5><div class="meta">${el.dataset.day} • ${el.dataset.shift}</div>
+      <div class="row"><span>Hours</span><strong>${el.dataset.hours}h</strong></div>
+      <div class="row"><span>Process</span><strong>${el.dataset.proc}</strong></div>
+      <div class="row"><span>Machine</span><strong>${el.dataset.machine}</strong></div>
+      <div class="row"><span>Operator</span><strong>${el.dataset.employee}</strong></div>`; }
+    document.addEventListener('mouseover',e=>{
+      const t=e.target.closest('[data-kind]'); if(!t) return;
+      showCard(t.dataset.kind==='assign'?assignHTML(t):backlogHTML(t), e.clientX,e.clientY);
+    });
+    document.addEventListener('mousemove',e=>{
+      if(card.classList.contains('show')) showCard(card.innerHTML, e.clientX,e.clientY);
+    });
+    document.addEventListener('mouseout',e=>{
+      const to=e.relatedTarget; if(!to||!to.closest||!to.closest('#hoverCard')) hideCard();
+    });
+    card.addEventListener('mouseleave', hideCard);
+  </script>
+</body>
+</html>
+{{end}}
+
