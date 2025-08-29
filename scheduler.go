@@ -1,150 +1,376 @@
 package main
 
 import (
-	"fmt"
-	"sort"
-	"time"
+	"cmp"
+	"slices"
 )
 
-// scheduleWeek: simple greedy baseline with 8h day/shift blocks.
-func scheduleWeek(weekStart time.Time, machines []Machine, emps []Employee, jobs []Job) []Assignment {
-	const days = 7
-	shiftOrder := []Shift{Day, Night}
+const ShiftMinutes = 8 * 60
+const WalkBuffer = 2 // minutes
 
-	// maps to track capacity used per (emp,day)
-	empDayUsed := make(map[string][days]int)
-	// machine usage map: (machine,day,shift) -> bool (one job per machine/shift block)
-	machineUsed := make(map[string]bool)
+// --- tiny helpers ---
 
-	assignments := make([]Assignment, 0)
-	mKey := func(mid string, day int, shift Shift) string {
-		return fmt.Sprintf("%s:%d:%s", mid, day, shift)
+func insertSorted(xs []int, v int) []int {
+	i := slices.IndexFunc(xs, func(x int) bool { return x >= v })
+	if i == -1 {
+		return append(xs, v)
 	}
-
-	// Split job hours across its processes evenly (remainder front-loaded)
-	splitHours := func(total int, n int) []int {
-		res := make([]int, n)
-		for i := 0; i < n; i++ {
-			res[i] = total / n
-		}
-		for i := 0; i < total%n; i++ {
-			res[i]++
-		}
-		return res
+	xs = append(xs, 0)
+	copy(xs[i+1:], xs[i:])
+	xs[i] = v
+	return xs
+}
+func abs(x int) int {
+	if x < 0 {
+		return -x
 	}
+	return x
+}
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
 
-	for _, job := range jobs {
-		perStep := splitHours(job.RunHours, len(job.Processes))
-		for pi, proc := range job.Processes {
-			remaining := perStep[pi]
-			for day := 0; day < days && remaining > 0; day++ {
-				for _, shift := range shiftOrder {
-					if remaining <= 0 {
-						break
-					}
-					// employees on this shift with skill
-					candEmps := filterEmployees(emps, func(e Employee) bool {
-						return hasSkill(e, proc) && e.Shift == shift
-					})
-					if len(candEmps) == 0 {
-						continue
-					}
-					// machines supporting this process and free this shift
-					candMacs := filterMachines(machines, func(m Machine) bool {
-						return supports(m, proc) && !machineUsed[mKey(m.ID, day, shift)]
-					})
-					if len(candMacs) == 0 {
-						continue
-					}
-					// prefer single-process machines first to keep hybrids free
-					sort.Slice(candMacs, func(i, j int) bool {
-						return len(candMacs[i].Processes) < len(candMacs[j].Processes)
-					})
-
-					var chosenEmp *Employee
-					for idx := range candEmps {
-						u := empDayUsed[candEmps[idx].ID]
-						if u[day] < candEmps[idx].HoursPerDay {
-							chosenEmp = &candEmps[idx]
-							break
-						}
-					}
-					if chosenEmp == nil {
-						continue
-					}
-					chosenMac := candMacs[0]
-
-					// schedule a block up to remaining or employee remaining or 8h shift
-					used := empDayUsed[chosenEmp.ID]
-					capLeft := chosenEmp.HoursPerDay - used[day]
-					if capLeft <= 0 {
-						continue
-					}
-					block := min(remaining, capLeft, 8)
-					assignments = append(assignments, Assignment{
-						DayIndex:   day,
-						Shift:      shift,
-						MachineID:  chosenMac.ID,
-						EmployeeID: chosenEmp.ID,
-						JobID:      job.ID,
-						Hours:      block,
-						Process:    proc,
-					})
-					used[day] += block
-					empDayUsed[chosenEmp.ID] = used
-					machineUsed[mKey(chosenMac.ID, day, shift)] = true
-					remaining -= block
+// Try to place events with a phase shift in [0..WalkBuffer] minutes.
+// Returns (ok, chosenStart).
+func tryAssign(events []int, startOffset, cycle, pieces int) (bool, int) {
+	for phase := 0; phase <= WalkBuffer; phase++ {
+		ok := true
+		for n := 0; n < pieces; n++ {
+			t := startOffset + phase + n*cycle
+			if t >= ShiftMinutes {
+				ok = false
+				break
+			}
+			// conflict to any existing event?
+			for _, e := range events {
+				if abs(t-e) < WalkBuffer {
+					ok = false
+					break
 				}
 			}
+			if !ok {
+				break
+			}
+		}
+		if ok {
+			return true, startOffset + phase
 		}
 	}
-	return assignments
+	return false, 0
 }
 
-func hasSkill(e Employee, p Process) bool {
-	for _, s := range e.Skills {
-		if s == p || s == Both {
-			return true
+// Commit events (at chosenStart + n*cycle) into a sorted list.
+func commit(events []int, chosenStart, cycle, pieces int) []int {
+	for n := 0; n < pieces; n++ {
+		t := chosenStart + n*cycle
+		if t >= ShiftMinutes {
+			break
 		}
+		events = insertSorted(events, t)
 	}
-	return false
+	return events
 }
 
-func supports(m Machine, p Process) bool {
-	for _, s := range m.Processes {
-		if s == p || s == Both {
-			return true
-		}
-	}
-	return false
-}
+// --- the main scheduler ---
 
-func min(nums ...int) int {
-	m := nums[0]
-	for _, n := range nums[1:] {
-		if n < m {
-			m = n
+func scheduleWeek(machs []Machine, emps []Employee, jobs []Job) ([]Assignment, map[int][]int) {
+	// Sort machines by name; employees: Day first, then name
+	slices.SortFunc(machs, func(a, b Machine) int { return cmp.Compare(a.Name, b.Name) })
+	slices.SortFunc(emps, func(a, b Employee) int {
+		if a.Shift != b.Shift {
+			if a.Shift == Day {
+				return -1
+			}
+			return 1
 		}
-	}
-	return m
-}
+		return cmp.Compare(a.Name, b.Name)
+	})
 
-func filterEmployees(list []Employee, pred func(Employee) bool) []Employee {
-	out := make([]Employee, 0, len(list))
-	for _, e := range list {
-		if pred(e) {
-			out = append(out, e)
+	// Machine capability pools
+	mills, lathes := []Machine{}, []Machine{}
+	for _, m := range machs {
+		if m.Processes[ProcMill] {
+			mills = append(mills, m)
+		}
+		if m.Processes[ProcTurn] {
+			lathes = append(lathes, m)
 		}
 	}
-	return out
-}
 
-func filterMachines(list []Machine, pred func(Machine) bool) []Machine {
-	out := make([]Machine, 0, len(list))
-	for _, m := range list {
-		if pred(m) {
-			out = append(out, m)
+	// Greedy pick: least total minutes already packed across week/shifts
+	type key struct {
+		mid, day int
+		sh       Shift
+	}
+	mCursor := map[key]int{} // minutes used per machine/day/shift
+	sumLoad := func(mid int) int {
+		total := 0
+		for d := 0; d < 7; d++ {
+			total += mCursor[key{mid, d, Day}]
+			total += mCursor[key{mid, d, Night}]
+		}
+		return total
+	}
+	pickMachine := func(proc Process) int {
+		pool := mills
+		if proc == ProcTurn {
+			pool = lathes
+		}
+		if len(pool) == 0 {
+			return 0
+		}
+		best := pool[0].ID
+		bestLoad := sumLoad(best)
+		for _, m := range pool[1:] {
+			if l := sumLoad(m.ID); l < bestLoad {
+				best, bestLoad = m.ID, l
+			}
+		}
+		return best
+	}
+
+	// Per-employee load “event” times (mins from shift start)
+	type esKey struct {
+		id, day int
+		sh      Shift
+	}
+	eventTimes := map[esKey][]int{}
+
+	// Employees grouped by shift and filtered for skill at call-site
+	empsByShift := map[Shift][]Employee{Day: {}, Night: {}}
+	for _, e := range emps {
+		empsByShift[e.Shift] = append(empsByShift[e.Shift], e)
+	}
+
+	// Utilization (minutes) per machine per day (day shift only, as before)
+	mUtil := map[int][]int{}
+	for _, m := range machs {
+		mUtil[m.ID] = make([]int, 7)
+	}
+
+	assignments := []Assignment{}
+
+	// For each job, place pieces on machines; assign employee immediately.
+	for _, job := range jobs {
+		minsLeft := job.Qty * job.CycleMins
+		if minsLeft <= 0 {
+			continue
+		}
+
+		mid := pickMachine(job.Process)
+		if mid == 0 {
+			continue
+		} // no capable machine
+
+		day, sh := 0, Day
+
+		for minsLeft > 0 && day < 7 {
+			k := key{mid, day, sh}
+			used := mCursor[k]
+			if used >= ShiftMinutes {
+				// advance shift/day
+				if sh == Day {
+					sh = Night
+				} else {
+					sh = Day
+					day++
+				}
+				continue
+			}
+
+			space := ShiftMinutes - used
+			if space < job.CycleMins {
+				// not enough time for even one piece -> next shift/day
+				if sh == Day {
+					sh = Night
+				} else {
+					sh = Day
+					day++
+				}
+				continue
+			}
+
+			// How many pieces fit here (cap by what's left)
+			maxPiecesHere := space / job.CycleMins
+			wantPieces := minsLeft / job.CycleMins
+			if wantPieces == 0 {
+				wantPieces = 1
+			}
+			if maxPiecesHere < wantPieces {
+				wantPieces = maxPiecesHere
+			}
+
+			// Find an operator; if none, bump the block to next day/shift and retry.
+			found := false
+			finalDay, finalShift := day, sh
+			finalEmp := 0
+
+			// Try current slot first, then roll ahead up to end of week
+			tryDay, tryShift := day, sh
+			for tries := 0; tries < 14 && tryDay < 7; tries++ {
+				kk := key{mid, tryDay, tryShift}
+				cur := mCursor[kk]
+				if cur >= ShiftMinutes {
+					if tryShift == Day {
+						tryShift = Night
+					} else {
+						tryShift = Day
+						tryDay++
+					}
+					continue
+				}
+				avail := ShiftMinutes - cur
+				if avail < job.CycleMins {
+					if tryShift == Day {
+						tryShift = Night
+					} else {
+						tryShift = Day
+						tryDay++
+					}
+					continue
+				}
+
+				herePieces := avail / job.CycleMins
+				pieces := wantPieces
+				if pieces > herePieces {
+					pieces = herePieces
+				}
+				if pieces == 0 {
+					if tryShift == Day {
+						tryShift = Night
+					} else {
+						tryShift = Day
+						tryDay++
+					}
+					continue
+				}
+
+				// Try employees for this shift with the right skill
+				candidate := 0
+				chosenStart := 0
+				for _, e := range empsByShift[tryShift] {
+					if !e.Skills[job.Process] {
+						continue
+					}
+					esK := esKey{e.ID, tryDay, tryShift}
+					ok, st := tryAssign(eventTimes[esK], cur, job.CycleMins, pieces)
+					if ok {
+						candidate = e.ID
+						chosenStart = st
+						break
+					}
+				}
+
+				if candidate != 0 {
+					// success: place block here
+					finalDay, finalShift = tryDay, tryShift
+					finalEmp = candidate
+
+					mCursor[kk] += pieces * job.CycleMins
+					if finalShift == Day {
+						mUtil[mid][finalDay] += pieces * job.CycleMins
+					}
+					esK := esKey{finalEmp, finalDay, finalShift}
+					eventTimes[esK] = commit(eventTimes[esK], chosenStart, job.CycleMins, pieces)
+
+					assignments = append(assignments, Assignment{
+						JobID:      job.ID,
+						MachineID:  mid,
+						DayIndex:   finalDay,
+						Shift:      finalShift,
+						Minutes:    pieces * job.CycleMins,
+						Pieces:     pieces,
+						CycleMins:  job.CycleMins,
+						Process:    job.Process,
+						EmployeeID: finalEmp,
+					})
+
+					minsLeft -= pieces * job.CycleMins
+					found = true
+					break
+				}
+
+				if tryShift == Day {
+					tryShift = Night
+				} else {
+					tryShift = Day
+					tryDay++
+				}
+			}
+
+			if !found {
+				// Could not find any operator through the week.
+				// Place the block at the original day/shift (or the last capacity-checked one) as UNASSIGNED,
+				// respecting machine capacity there.
+				kk := key{mid, day, sh}
+				cur := mCursor[kk]
+				avail := ShiftMinutes - cur
+				if avail < job.CycleMins {
+					// advance day/shift until some capacity exists; if none anywhere, break
+					dd, ss := day, sh
+					ok := false
+					for dd < 7 && !ok {
+						if ss == Day {
+							ss = Night
+						} else {
+							ss = Day
+							dd++
+						}
+						if dd >= 7 {
+							break
+						}
+						if mCursor[key{mid, dd, ss}] <= ShiftMinutes-job.CycleMins {
+							ok = true
+							day, sh = dd, ss
+						}
+					}
+					if !ok {
+						break
+					} // nowhere to place
+					kk = key{mid, day, sh}
+					cur = mCursor[kk]
+					avail = ShiftMinutes - cur
+				}
+				pieces := avail / job.CycleMins
+				if pieces > minsLeft/job.CycleMins {
+					pieces = minsLeft / job.CycleMins
+				}
+				if pieces == 0 { // safety
+					if sh == Day {
+						sh = Night
+					} else {
+						sh = Day
+						day++
+					}
+					continue
+				}
+
+				mCursor[kk] += pieces * job.CycleMins
+				if sh == Day {
+					mUtil[mid][day] += pieces * job.CycleMins
+				}
+
+				assignments = append(assignments, Assignment{
+					JobID:     job.ID,
+					MachineID: mid,
+					DayIndex:  day,
+					Shift:     sh,
+					Minutes:   pieces * job.CycleMins,
+					Pieces:    pieces,
+					CycleMins: job.CycleMins,
+					Process:   job.Process,
+					// EmployeeID: 0 (unassigned)
+				})
+				minsLeft -= pieces * job.CycleMins
+			}
+
+			// Continue filling from the *current* day/shift (they may still have capacity)
+			// Loop will try here again first; if full it advances.
 		}
 	}
-	return out
+
+	return assignments, mUtil
 }

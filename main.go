@@ -1,238 +1,241 @@
 package main
 
 import (
-	"bytes"
-	"embed"
-	"encoding/json"
 	"fmt"
 	"html/template"
 	"log"
 	"net/http"
-	"sort"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
-// --- In-memory store and view model ---
+var currentAssignments []Assignment
+var currentUtil map[int][]int
 
-var store = struct {
-	mu          sync.RWMutex
-	machines    []Machine
-	employees   []Employee
-	jobs        []Job
-	assignments []Assignment
-	weekStart   time.Time
-}{}
+type TimeYMD struct{ time.Time }
 
-// Derived utilization: employee -> [7]int (hours booked that day)
-type Utilization map[string][]int
+func (t TimeYMD) Format(f string) string { return t.Time.Format(f) }
 
-// in main.go (viewModel)
-type viewModel struct {
-	WeekStart   time.Time
-	Days        []time.Time
-	Machines    []Machine
-	Employees   []Employee
-	Jobs        []Job
-	Assignments []Assignment
-
-	EmpByID map[string]Employee
-	MacByID map[string]Machine
-	JobByID map[string]Job
-
-	Util        Utilization
-	Backlog     []Job
-	JobHours    map[string]int
-	EmpWeekLeft map[string]int // <- NEW: remaining hours across week
+func startOfWeek(t time.Time) time.Time {
+	// Monday as start
+	w := int(t.Weekday())
+	if w == 0 {
+		w = 7
+	}
+	return time.Date(t.Year(), t.Month(), t.Day()-w+1, 0, 0, 0, 0, t.Location())
 }
 
-//go:embed templates/*
-var templatesFS embed.FS
+func pctMins(mins int) string {
+	if mins <= 0 {
+		return "0%"
+	}
+	if mins >= ShiftMinutes {
+		return "100%"
+	}
+	p := float64(mins) / float64(ShiftMinutes) * 100.0
+	return template.HTMLEscapeString(sprintFloat(p)) + "%"
+}
+func sprintFloat(f float64) string {
+	return strconv.FormatFloat(f, 'f', 0, 64)
+}
+func title(s string) string {
+	if len(s) == 0 {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+func sub(a, b int) int { return a - b }
 
-var tmpl = template.Must(
-	template.New("base").
-		Option("missingkey=zero").
-		Funcs(template.FuncMap{
-			"title": func(v any) string {
-				s := fmt.Sprint(v)
-				if s == "" {
-					return s
-				}
-				return strings.ToUpper(s[:1]) + strings.ToLower(s[1:])
-			},
-			"pctHours": func(h int) string {
-				if h < 0 {
-					h = 0
-				}
-				if h > 8 {
-					h = 8
-				}
-				return fmt.Sprintf("%.5f%%", (float64(h)/8.0)*100.0)
-			},
-			"sub": func(a, b int) int { return a - b }, // <- add
-		}).
-		ParseFS(templatesFS, "templates/*.gohtml"),
-)
+func mul(a, b int) int { return a * b }
+func max0(x int) int {
+	if x < 0 {
+		return 0
+	}
+	return x
+}
+
+var tpl *template.Template
+
+func hasProc(m Machine, p string) bool   { return m.Processes[Process(p)] }
+func hasSkill(e Employee, p string) bool { return e.Skills[Process(p)] }
+func minsToHM(mins int) string {
+	if mins <= 0 {
+		return "0m"
+	}
+	h := mins / 60
+	m := mins % 60
+	if h == 0 {
+		return fmt.Sprintf("%dm", m)
+	}
+	if m == 0 {
+		return fmt.Sprintf("%dh", h)
+	}
+	return fmt.Sprintf("%dh %dm", h, m)
+}
+
+// imports you may need on top:
+// import "strings"
+
+func procTitle(p Process) string {
+	switch p {
+	case ProcMill:
+		return "Mill"
+	case ProcTurn:
+		return "Turn"
+	default:
+		// fallback if you add more later
+		return strings.Title(string(p))
+	}
+}
+
+var empPalette = []string{
+	"bg-rose-900/40",
+	"bg-amber-900/40",
+	"bg-emerald-900/40",
+	"bg-sky-900/40",
+	"bg-fuchsia-900/40",
+	"bg-teal-900/40",
+	"bg-indigo-900/40",
+	"bg-lime-900/40",
+}
+
+func empClass(eid int) string {
+	if eid == 0 {
+		// Unassigned
+		return "bg-gray-700/50 ring-1 ring-red-500/40"
+	}
+	// Stable-ish hash to palette
+	idx := eid % len(empPalette)
+	if idx < 0 {
+		idx = -idx
+	}
+	return empPalette[idx] + " ring-1 ring-white/10"
+}
 
 func main() {
-	seedData()
-
-	// compute Monday week start
-	now := time.Now()
-	wd := int(now.Weekday())
-	if wd == 0 {
-		wd = 7
+	// Template funcs
+	funcs := template.FuncMap{
+		"title":     title,
+		"sub":       sub,
+		"mul":       mul,  // NEW
+		"max0":      max0, // NEW
+		"pctMins":   pctMins,
+		"hasProc":   hasProc,
+		"hasSkill":  hasSkill,
+		"minsToHM":  minsToHM,
+		"procTitle": procTitle,
+		"empClass":  empClass,
 	}
-	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, -(wd - 1))
 
-	store.weekStart = start
-	store.assignments = nil // <-- start empty for demo
+	// Parse templates
+	var err error
+	tpl, err = template.New("").Funcs(funcs).ParseFiles("templates/index.gohtml")
+	if err != nil {
+		log.Fatal(err)
+	}
 
+	// Static
+	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
 	http.HandleFunc("/", handleIndex)
-	http.HandleFunc("/api/override", handleOverride)
+	http.HandleFunc("/api/auto", handleAuto)
 	http.HandleFunc("/api/reset", handleReset)
-
-	log.Println("Machine Shop Scheduler running on http://localhost:8080 …")
+	log.Printf("Machine Shop Scheduler running on http://localhost:8080 …")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-func handleIndex(w http.ResponseWriter, r *http.Request) {
-	store.mu.RLock()
-	vm := buildViewModel()
-	store.mu.RUnlock()
-
-	log.Printf("INDEX: employees=%d machines=%d jobs=%d assignments=%d",
-		len(vm.Employees), len(vm.Machines), len(vm.Jobs), len(vm.Assignments))
-
-	var buf bytes.Buffer
-	if err := tmpl.ExecuteTemplate(&buf, "index.gohtml", vm); err != nil {
-		log.Printf("template error: %v", err)
-		http.Error(w, "template render error", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write(buf.Bytes())
+func handleReset(w http.ResponseWriter, r *http.Request) {
+	currentAssignments = nil
+	currentUtil = nil
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-func buildViewModel() viewModel {
-	days := make([]time.Time, 7)
+func handleAuto(w http.ResponseWriter, r *http.Request) {
+	machs := demoMachines()
+	emps := demoEmployees()
+	jobs := demoJobs()
+
+	currentAssignments, currentUtil = scheduleWeek(machs, emps, jobs)
+
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func handleIndex(w http.ResponseWriter, r *http.Request) {
+	machs := demoMachines()
+	emps := demoEmployees()
+	jobs := demoJobs()
+
+	now := time.Now()
+	ws := startOfWeek(now)
+	days := make([]TimeYMD, 7)
 	for i := 0; i < 7; i++ {
-		days[i] = store.weekStart.AddDate(0, 0, i)
+		days[i] = TimeYMD{ws.AddDate(0, 0, i)}
 	}
-	empBy := make(map[string]Employee, len(store.employees))
-	for _, e := range store.employees {
-		empBy[e.ID] = e
-	}
-	macBy := make(map[string]Machine, len(store.machines))
-	for _, m := range store.machines {
-		macBy[m.ID] = m
-	}
-	jobBy := make(map[string]Job, len(store.jobs))
-	for _, j := range store.jobs {
+
+	jobBy := map[int]Job{}
+	macBy := map[int]Machine{}
+	empBy := map[int]Employee{}
+	for _, j := range jobs {
 		jobBy[j.ID] = j
 	}
-
-	// Utilization
-	util := make(Utilization, len(store.employees))
-	for _, e := range store.employees {
-		util[e.ID] = make([]int, 7)
+	for _, m := range machs {
+		macBy[m.ID] = m
+	}
+	for _, e := range emps {
+		empBy[e.ID] = e
 	}
 
-	// Hours scheduled per job
-	jobHours := make(map[string]int, len(store.jobs))
-	for _, a := range store.assignments {
-		if _, ok := util[a.EmployeeID]; ok && a.DayIndex >= 0 && a.DayIndex < 7 {
-			util[a.EmployeeID][a.DayIndex] += a.Hours
-			if util[a.EmployeeID][a.DayIndex] > 8 {
-				util[a.EmployeeID][a.DayIndex] = 8
-			}
-		}
-		jobHours[a.JobID] += a.Hours
+	colors := []string{
+		"bg-rose-400",
+		"bg-emerald-400",
+		"bg-indigo-400",
+		"bg-amber-400",
+		"bg-cyan-400",
+		"bg-fuchsia-400",
+		"bg-lime-400",
 	}
 
-	// Backlog = jobs with remaining hours > 0
-	backlog := make([]Job, 0, len(store.jobs))
-	for _, j := range store.jobs {
-		if jobHours[j.ID] < j.RunHours {
+	empColors := map[int]string{}
+	i := 0
+	for _, e := range emps {
+		empColors[e.ID] = colors[i%len(colors)]
+		i++
+	}
+
+	// minutes already scheduled per job
+	jobMinsDone := map[int]int{}
+	for _, a := range currentAssignments {
+		jobMinsDone[a.JobID] += a.Minutes
+	}
+
+	// only show jobs with remaining work
+	backlog := make([]Job, 0, len(jobs))
+	for _, j := range jobs {
+		total := j.Qty * j.CycleMins
+		if jobMinsDone[j.ID] < total { // remaining > 0
 			backlog = append(backlog, j)
 		}
 	}
 
-	emps := make([]Employee, len(store.employees))
-	copy(emps, store.employees)
-	sort.Slice(emps, func(i, j int) bool {
-		// Day before Night
-		if emps[i].Shift != emps[j].Shift {
-			return emps[i].Shift == Day
-		}
-		// then by Name
-		return emps[i].Name < emps[j].Name
-	})
-
-	// Weekly hours left per employee (7 * HoursPerDay - used)
-	empWeekLeft := make(map[string]int, len(store.employees))
-	for _, e := range store.employees {
-		used := 0
-		for _, h := range util[e.ID] {
-			used += h
-		}
-		empWeekLeft[e.ID] = 7*e.HoursPerDay - used
-	}
-
-	return viewModel{
-		WeekStart:   store.weekStart,
+	vm := ViewModel{
+		WeekStart:   TimeYMD{ws},
 		Days:        days,
-		Machines:    store.machines,
-		Employees:   emps, // sorted list if you added sorting earlier
-		Jobs:        store.jobs,
-		Assignments: store.assignments,
-		EmpByID:     empBy,
-		MacByID:     macBy,
-		JobByID:     jobBy,
-		Util:        util,
+		Machines:    machs,
+		Employees:   emps,
+		Jobs:        jobs,
 		Backlog:     backlog,
-		JobHours:    jobHours,
-		EmpWeekLeft: empWeekLeft, // <- pass to template
+		Assignments: currentAssignments, // <-- use saved plan (may be empty)
+		JobByID:     jobBy,
+		MacByID:     macBy,
+		EmpByID:     empBy,
+		Util:        currentUtil,
+		JobMinsDone: jobMinsDone,
+		EmpColors:   empColors,
 	}
-}
 
-func handleOverride(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+	if err := tpl.ExecuteTemplate(w, "index.gohtml", vm); err != nil {
+		log.Printf("template error: %v", err)
+		http.Error(w, "template error", http.StatusInternalServerError)
 		return
 	}
-	var dto struct {
-		DayIndex   int     `json:"dayIndex"`
-		Shift      Shift   `json:"shift"`
-		MachineID  string  `json:"machineId"`
-		EmployeeID string  `json:"employeeId"`
-		JobID      string  `json:"jobId"`
-		Hours      int     `json:"hours"`
-		Process    Process `json:"process"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&dto); err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
-	store.mu.Lock()
-	store.assignments = append(store.assignments, Assignment{
-		DayIndex:   dto.DayIndex,
-		Shift:      dto.Shift,
-		MachineID:  dto.MachineID,
-		EmployeeID: dto.EmployeeID,
-		JobID:      dto.JobID,
-		Hours:      dto.Hours,
-		Process:    dto.Process,
-	})
-	store.mu.Unlock()
-	w.WriteHeader(http.StatusCreated)
-}
-
-func handleReset(w http.ResponseWriter, r *http.Request) {
-	store.mu.Lock()
-	store.assignments = scheduleWeek(store.weekStart, store.machines, store.employees, store.jobs)
-	log.Printf("Auto-scheduled %d assignments", len(store.assignments))
-	store.mu.Unlock()
-	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
